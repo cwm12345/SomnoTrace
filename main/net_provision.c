@@ -2321,83 +2321,66 @@ static void rebuild_day_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* Progress tracking for SD format (polled by the browser via
- * /api/format-progress).  The format itself can run for tens of seconds on a
- * large card, far longer than an HTTP request should stay open, so the handler
- * returns immediately and the UI polls this. */
+/* SD format progress, polled by the browser via /api/format-progress.  The
+ * format runs tens of seconds on a large card, far longer than an HTTP request
+ * should stay open, so actions_handler returns immediately and the UI polls.
+ * actions_handler zeroes this and sets .active before starting the task. */
 typedef struct {
-    volatile bool active;      /* format task is running          */
-    volatile bool done;        /* finished — check ok             */
-    volatile bool ok;          /* true if the format succeeded    */
-    volatile bool rebooting;   /* device is about to esp_restart() */
-    char error[64];            /* error string when !ok           */
+    volatile bool active;   /* format task is running       */
+    volatile bool done;     /* task finished — check .ok     */
+    volatile bool ok;       /* format succeeded             */
+    char error[64];         /* failure reason when !ok      */
 } format_progress_t;
 static format_progress_t s_format_progress;
 
-/* Background task for SD card format (destructive).  Runs in a PSRAM-backed
- * task because the format can take tens of seconds and must not block the HTTP
- * handler.  Holds the destructive lease for the whole operation, including the
- * reboot, so nothing writes to the card in between. */
+/* Background task for the destructive SD format.  PSRAM-backed because the
+ * format is slow and must not block the HTTP handler.  Holds the destructive
+ * lease for the whole operation, including the reboot, so nothing writes to the
+ * card in between.  The success path never returns (it reboots). */
 static void format_sd_task(void *arg)
 {
     ESP_LOGW(TAG, "format_sd_task: starting destructive format");
 
-    memset((void *)&s_format_progress, 0, sizeof(s_format_progress));
-    s_format_progress.active = true;
-
     if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 5000)) {
-        ESP_LOGE(TAG, "format_sd_task: SD busy, format refused");
         strlcpy(s_format_progress.error,
                 "SD busy (recording, export or upload in progress)",
                 sizeof(s_format_progress.error));
-        s_format_progress.active = false;
-        s_format_progress.done = true;
-        vTaskDelete(NULL);
-        return;
-    }
+    } else {
+        uploader_reset_state();   /* all tracked data is about to be destroyed */
 
-    /* Reset upload state — all tracked data is about to be destroyed. */
-    uploader_reset_state();
-
-    esp_err_t ret = sd_storage_format();
-    if (ret != ESP_OK) {
+        esp_err_t ret = sd_storage_format();
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "format_sd_task: formatted OK, rebooting for clean remount");
+            s_format_progress.ok = true;
+            s_format_progress.done = true;
+            s_format_progress.active = false;
+            /* Give the browser poll (2 s interval) time to read the result,
+             * then flush the fresh filesystem and reboot. */
+            vTaskDelay(pdMS_TO_TICKS(2500));
+            sd_storage_deinit();
+            esp_restart();
+        }
         ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
         strlcpy(s_format_progress.error, esp_err_to_name(ret),
                 sizeof(s_format_progress.error));
         sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
-        s_format_progress.active = false;
-        s_format_progress.done = true;
-        vTaskDelete(NULL);
-        return;
     }
 
-    ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully");
-    s_format_progress.ok = true;
-    s_format_progress.active = false;
     s_format_progress.done = true;
-
-    /* Let the browser poll observe done+ok before the link drops, then flush
-     * the freshly written filesystem and reboot for a clean remount.  The
-     * destructive lease is deliberately held to the end. */
-    vTaskDelay(pdMS_TO_TICKS(2500));
-    ESP_LOGI(TAG, "format_sd_task: rebooting for clean remount");
-    s_format_progress.rebooting = true;
-    sd_storage_deinit();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    esp_restart();
+    s_format_progress.active = false;
+    vTaskDelete(NULL);
 }
 
 static esp_err_t format_progress_handler(httpd_req_t *req)
 {
-    httpd_resp_set_type(req, "application/json");
-    char resp[160];
+    char resp[128];
     snprintf(resp, sizeof(resp),
-             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"rebooting\":%s,\"error\":\"%s\"}",
+             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"error\":\"%s\"}",
              s_format_progress.active ? "true" : "false",
              s_format_progress.done ? "true" : "false",
              s_format_progress.ok ? "true" : "false",
-             s_format_progress.rebooting ? "true" : "false",
              s_format_progress.error);
+    httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, resp);
     return ESP_OK;
 }
