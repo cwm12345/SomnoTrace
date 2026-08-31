@@ -2343,11 +2343,13 @@ static void format_sd_task(void *arg)
 
     if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 5000)) {
         strlcpy(s_format_progress.error,
-                "SD busy (recording, export or upload in progress)",
+                "SD busy — a recording, export or upload is using the card",
                 sizeof(s_format_progress.error));
     } else {
-        uploader_reset_state();   /* all tracked data is about to be destroyed */
-
+        /* No uploader_reset_state() here: on success the reboot re-inits the
+         * uploader against the now-empty state dir, and on failure the old
+         * state is still valid.  Calling it would also wake the upload
+         * scheduler to rescan the card mid-format. */
         esp_err_t ret = sd_storage_format();
         if (ret == ESP_OK) {
             ESP_LOGI(TAG, "format_sd_task: formatted OK, rebooting for clean remount");
