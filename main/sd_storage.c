@@ -407,3 +407,25 @@ esp_err_t sd_storage_format(void)
     ESP_LOGI(TAG, "format: SD card formatted and directory tree recreated");
     return ESP_OK;
 }
+
+void sd_storage_deinit(void)
+{
+    if (!s_mounted || !s_card) {
+        s_mounted = false;
+        s_card = NULL;
+        return;
+    }
+
+    /* f_unmount (inside the VFS unmount) syncs the FAT window and issues a
+     * final CTRL_SYNC so the card commits its own write buffer.  Without this,
+     * a reboot immediately after a format or a burst of writes can land before
+     * the card has flushed. */
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "deinit: unmount failed: %s", esp_err_to_name(ret));
+    else
+        ESP_LOGI(TAG, "deinit: SD flushed and unmounted");
+
+    s_mounted = false;
+    s_card = NULL;
+}

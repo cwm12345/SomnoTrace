@@ -2321,25 +2321,85 @@ static void rebuild_day_task(void *arg)
     vTaskDelete(NULL);
 }
 
+/* Progress tracking for SD format (polled by the browser via
+ * /api/format-progress).  The format itself can run for tens of seconds on a
+ * large card, far longer than an HTTP request should stay open, so the handler
+ * returns immediately and the UI polls this. */
+typedef struct {
+    volatile bool active;      /* format task is running          */
+    volatile bool done;        /* finished — check ok             */
+    volatile bool ok;          /* true if the format succeeded    */
+    volatile bool rebooting;   /* device is about to esp_restart() */
+    char error[64];            /* error string when !ok           */
+} format_progress_t;
+static format_progress_t s_format_progress;
+
 /* Background task for SD card format (destructive).  Runs in a PSRAM-backed
- * task because esp_vfs_fat_sdcard_format() can take several seconds and must
- * not block the HTTP handler.  Also resets upload state since all data is gone. */
+ * task because the format can take tens of seconds and must not block the HTTP
+ * handler.  Holds the destructive lease for the whole operation, including the
+ * reboot, so nothing writes to the card in between. */
 static void format_sd_task(void *arg)
 {
     ESP_LOGW(TAG, "format_sd_task: starting destructive format");
 
-    /* Reset upload state first — all tracked data is about to be destroyed. */
+    memset((void *)&s_format_progress, 0, sizeof(s_format_progress));
+    s_format_progress.active = true;
+
+    if (!sd_storage_lease_acquire(SD_LEASE_DESTRUCTIVE, 5000)) {
+        ESP_LOGE(TAG, "format_sd_task: SD busy, format refused");
+        strlcpy(s_format_progress.error,
+                "SD busy (recording, export or upload in progress)",
+                sizeof(s_format_progress.error));
+        s_format_progress.active = false;
+        s_format_progress.done = true;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Reset upload state — all tracked data is about to be destroyed. */
     uploader_reset_state();
 
     esp_err_t ret = sd_storage_format();
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "format_sd_task: failed: %s", esp_err_to_name(ret));
-    } else {
-        ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully, rebooting");
-        psram_task_create(reboot_task, "format_reboot", 4096, NULL, 5, tskNO_AFFINITY, NULL, NULL);
+        strlcpy(s_format_progress.error, esp_err_to_name(ret),
+                sizeof(s_format_progress.error));
+        sd_storage_lease_release(SD_LEASE_DESTRUCTIVE);
+        s_format_progress.active = false;
+        s_format_progress.done = true;
+        vTaskDelete(NULL);
+        return;
     }
 
-    vTaskDelete(NULL);
+    ESP_LOGI(TAG, "format_sd_task: SD card formatted successfully");
+    s_format_progress.ok = true;
+    s_format_progress.active = false;
+    s_format_progress.done = true;
+
+    /* Let the browser poll observe done+ok before the link drops, then flush
+     * the freshly written filesystem and reboot for a clean remount.  The
+     * destructive lease is deliberately held to the end. */
+    vTaskDelay(pdMS_TO_TICKS(2500));
+    ESP_LOGI(TAG, "format_sd_task: rebooting for clean remount");
+    s_format_progress.rebooting = true;
+    sd_storage_deinit();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+}
+
+static esp_err_t format_progress_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"active\":%s,\"done\":%s,\"ok\":%s,\"rebooting\":%s,\"error\":\"%s\"}",
+             s_format_progress.active ? "true" : "false",
+             s_format_progress.done ? "true" : "false",
+             s_format_progress.ok ? "true" : "false",
+             s_format_progress.rebooting ? "true" : "false",
+             s_format_progress.error);
+    httpd_resp_sendstr(req, resp);
+    return ESP_OK;
 }
 
 /* ── OTA firmware upload ─────────────────────────────────────────── */
@@ -2832,9 +2892,17 @@ static esp_err_t actions_handler(httpd_req_t *req)
             cJSON_Delete(root);
             return send_busy(req, "therapy recording in progress");
         }
+        if (s_format_progress.active) {
+            cJSON_Delete(root);
+            return send_busy(req, "format already in progress");
+        }
         ESP_LOGI(TAG, "action: format SD card (destructive)");
+        /* Clear any previous result so /api/format-progress reports this run. */
+        memset((void *)&s_format_progress, 0, sizeof(s_format_progress));
+        s_format_progress.active = true;
         TaskHandle_t h = psram_task_create(format_sd_task, "format_sd", 16384, NULL, 5, 1, NULL, NULL);
         if (!h) {
+            s_format_progress.active = false;
             err = ESP_ERR_NO_MEM;
         }
     } else {
@@ -3014,6 +3082,9 @@ static esp_err_t start_webserver(void)
     /* Consolidated actions endpoint */
     httpd_uri_t actions = { .uri = "/api/actions", .method = HTTP_POST, .handler = actions_handler };
     httpd_register_uri_handler(s_httpd, &actions);
+
+    httpd_uri_t format_prog = { .uri = "/api/format-progress", .method = HTTP_GET, .handler = format_progress_handler };
+    httpd_register_uri_handler(s_httpd, &format_prog);
 
     /* OTA firmware upload endpoint */
     httpd_uri_t ota_upload = { .uri = "/api/ota", .method = HTTP_POST, .handler = ota_upload_handler };
