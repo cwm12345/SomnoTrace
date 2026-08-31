@@ -324,9 +324,16 @@ esp_err_t sd_storage_format(void)
 {
     ESP_LOGW(TAG, "format: formatting SD card — ALL DATA WILL BE LOST");
 
+    /* Report the card as unavailable for the whole operation: the volume is
+     * unmounted while f_mkfs runs, and other subsystems (log flush, oximetry
+     * dir creation) gate their SD writes on sd_storage_is_ready().  Restored
+     * to true on success below. */
+    bool was_mounted = s_mounted;
+    s_mounted = false;
+
     esp_err_t ret;
 
-    if (s_mounted) {
+    if (was_mounted) {
         /* Card is already mounted — pre-erase the first 8 sectors so any
          * residual exFAT boot-sector signature in sector 0 cannot confuse
          * f_mkfs on a future re-flash, then format in-place. */
@@ -352,9 +359,9 @@ esp_err_t sd_storage_format(void)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "format: esp_vfs_fat_sdcard_format_cfg failed: %s",
                      esp_err_to_name(ret));
-            s_mounted = false;
             return ret;
         }
+        s_mounted = true;
     } else {
         /* Card not mounted — common cause: factory 64 GB SDXC cards ship with
          * exFAT.  ESP-IDF 5.5 builds FATFS with FF_FS_EXFAT=0, so the mount
