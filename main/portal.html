@@ -2587,7 +2587,7 @@ function execAction(action, confirmMsg) {
       if (d.ok) {
         if (action === 'format-sd') {
           /* Format runs in the background; poll for the real result. */
-          if (statusEl) { statusEl.textContent = 'Formatting SD card… this can take a minute. Do not power off.'; statusEl.className = 'status-msg'; }
+          if (statusEl) { statusEl.textContent = 'Formatting SD card… this can take a minute. The device reboots when it finishes. Do not power off.'; statusEl.className = 'status-msg'; }
           pollFormatProgress(0);
           return;
         }
