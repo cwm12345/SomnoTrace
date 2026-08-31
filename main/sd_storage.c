@@ -50,11 +50,13 @@ static sdmmc_card_t *s_card = NULL;
 #define SD_RESERVE_BYTES   (24ULL * 1024 * 1024)   /* warn below 24 MB  */
 #define SD_FLOOR_BYTES     (8ULL * 1024 * 1024)    /* refuse below 8 MB */
 
-/* Explicit cluster size for formatting.  Passing 0 makes ESP-IDF fall back to
- * the 512-byte sector size; on a 32-64 GB card that is tens of millions of
- * FAT32 clusters and a multi-hundred-MB FAT built through a 4 KB buffer, so
- * f_mkfs aborts (FR_MKFS_ABORTED) or runs long enough to trip the watchdog.
- * 32 KB is the standard choice for this capacity range. */
+/* Explicit cluster size for f_mkfs.  This MUST be set: passing 0 lets ESP-IDF
+ * default it to the 512-byte sector size, and on a 32-64 GB card that means
+ * ~60-130M FAT32 clusters and a FAT table hundreds of MB wide, built through a
+ * 4 KB work buffer.  f_mkfs then either returns FR_MKFS_ABORTED or runs for
+ * minutes and trips the task watchdog, so "Format SD" appears to do nothing.
+ * 32 KB is the normal cluster size for this capacity and keeps the FAT small
+ * enough to write in a few seconds. */
 #define SD_FORMAT_ALLOC_UNIT  (32 * 1024)
 
 /* ── Arbitration state ────────────────────────────────────────────── */
